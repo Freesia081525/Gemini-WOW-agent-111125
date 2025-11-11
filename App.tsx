@@ -2,13 +2,74 @@ import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, PieChart, Pie, Cell, Legend,
 } from 'recharts';
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { Agent, AgentStatus, DocumentFile, DocumentType, AnalysisResult } from './types';
 import { DEFAULT_AGENTS, FLOWER_THEMES, LOCALIZATION } from './constants';
-import { processAgentPrompt, performOcr, initGeminiService } from './services/geminiService';
 import AgentStep from './components/AgentStep';
 import { PlusIcon, PlayIcon, UploadIcon, DocumentIcon, FileTextIcon, SettingsIcon, PaletteIcon, LanguageIcon, SunIcon, MoonIcon } from './components/icons';
 
 declare const pdfjsLib: any;
+
+// --- Gemini Service Logic ---
+let ai: GoogleGenerativeAI | null = null;
+
+/**
+ * Initializes the Gemini Service with an API key.
+ * @param apiKey The Google AI Studio API key.
+ */
+const initGeminiService = (apiKey: string) => {
+  if (!apiKey) {
+    console.error("Attempted to initialize Gemini Service with an empty API key.");
+    ai = null;
+    return;
+  }
+  ai = new GoogleGenerativeAI(apiKey);
+};
+
+const processAgentPrompt = async (prompt: string, documentContent: string): Promise<string> => {
+  if (!ai) {
+    throw new Error("Gemini API key is not configured. Please set it first.");
+  }
+  
+  const fullPrompt = `DOCUMENT CONTENT:\n---\n${documentContent}\n---\n\nTASK:\n${prompt}`;
+
+  try {
+    const model = ai.getGenerativeModel({ model: "gemini-2.5-flash" });
+    const result = await model.generateContent(fullPrompt);
+    const response = await result.response;
+    return response.text();
+  } catch (error) {
+    console.error("Error processing agent prompt:", error);
+    if (error instanceof Error && error.message.includes('API key not valid')) {
+        throw new Error('The provided API key is not valid. Please check it and try again.');
+    }
+    throw new Error("Failed to get response from Gemini API.");
+  }
+};
+
+const performOcr = async (imageDataBase64: string): Promise<string> => {
+  if (!ai) {
+    throw new Error("Gemini API key is not configured. Please set it first.");
+  }
+
+  const imagePart = { inlineData: { mimeType: 'image/jpeg', data: imageDataBase64 } };
+  const textPart = { text: "Perform OCR on this image. Extract all text accurately, preserving the original line breaks and structure as much as possible. Do not describe the image, only return the transcribed text." };
+  
+  try {
+    const model = ai.getGenerativeModel({ model: "gemini-2.5-flash" });
+    const result = await model.generateContent([textPart, imagePart]);
+    const response = await result.response;
+    return response.text();
+  } catch (error) {
+    console.error("Error performing OCR:", error);
+    if (error instanceof Error && error.message.includes('API key not valid')) {
+        throw new Error('The provided API key is not valid. Please check it and try again.');
+    }
+    throw new Error("Failed to perform OCR with Gemini API.");
+  }
+};
+// --- End of Gemini Service Logic ---
+
 
 // A custom hook to persist state in localStorage
 function useLocalStorage<T>(key: string, initialValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
@@ -104,6 +165,10 @@ const App: React.FC = () => {
   }
 
   const processPdf = async (file: File) => {
+    if (!isApiKeySet) {
+        setApiKeyError("Please set your API key before processing a PDF.");
+        return;
+    }
     setIsOcrProcessing(true);
     try {
       const fileReader = new FileReader();
@@ -191,6 +256,10 @@ const App: React.FC = () => {
   };
 
   const runWorkflow = useCallback(async () => {
+    if (!isApiKeySet) {
+        setApiKeyError("Please set your API key before running the workflow.");
+        return;
+    }
     if (!documentFile.content || documentFile.type === DocumentType.EMPTY) {
       alert("Please load a document first.");
       return;
@@ -221,7 +290,7 @@ const App: React.FC = () => {
     }
     analyzeResults(currentAgents);
     setIsProcessing(false);
-  }, [agents, documentFile.content, documentFile.type, setUserApiKey]);
+  }, [agents, documentFile.content, documentFile.type, setUserApiKey, isApiKeySet]);
   
   const ApiKeyModal = () => (
     <div className="fixed inset-0 bg-gray-900/80 backdrop-blur-sm flex items-center justify-center z-50">
@@ -234,7 +303,10 @@ const App: React.FC = () => {
                 <input 
                     type="password" 
                     value={tempApiKey}
-                    onChange={(e) => setTempApiKey(e.target.value)}
+                    onChange={(e) => {
+                        setTempApiKey(e.target.value);
+                        if (apiKeyError) setApiKeyError(''); // Clear error on new input
+                    }}
                     placeholder="Enter your Gemini API key"
                     className="w-full p-3 bg-gray-100 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-primary transition"
                 />
@@ -253,14 +325,15 @@ const App: React.FC = () => {
         </div>
     </div>
   );
+
   const NotesEditor = () => {
     const [notes, setNotes] = useLocalStorage('reviewNotes', `# ${T.yourNotes}\n\n`);
     const [textToColor, setTextToColor] = useState('');
     const [color, setColor] = useState('#E91E63');
-  const applyColor = () => {
+
+    const applyColor = () => {
         if (!textToColor.trim()) return;
         const coloredText = `<span style="color: ${color}; font-weight: 600;">${textToColor}</span>`;
-        // Replace only the first occurrence to avoid infinite loops if colored text is re-colored
         setNotes(notes.replace(textToColor, coloredText));
         setTextToColor('');
     };
@@ -289,7 +362,6 @@ const App: React.FC = () => {
     );
   };
   
-
   const TabButton = ({ tabName, label }: { tabName: string, label: string }) => (
     <button onClick={() => setActiveTab(tabName)} className={`px-4 py-2 text-sm font-semibold rounded-md transition-all duration-200 ${activeTab === tabName ? 'bg-primary text-white shadow' : 'text-gray-600 dark:text-gray-300 hover:bg-primary/10'}`}>
         {label}
@@ -298,6 +370,8 @@ const App: React.FC = () => {
 
   return (
     <div style={{'--primary': activeTheme.colors.primary} as React.CSSProperties} className="font-sans text-gray-800 dark:text-gray-200 min-h-screen bg-gray-100 dark:bg-gray-900 transition-colors duration-300">
+        {!isApiKeySet && <ApiKeyModal />}
+        
         {/* Header */}
         <header className="bg-white/80 dark:bg-gray-800/80 backdrop-blur-sm border-b border-gray-200 dark:border-gray-700 p-4 shadow-sm sticky top-0 z-10">
             <div className="max-w-screen-xl mx-auto flex justify-between items-center">
