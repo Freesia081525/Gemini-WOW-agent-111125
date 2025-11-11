@@ -4,7 +4,7 @@ import {
 } from 'recharts';
 import { Agent, AgentStatus, DocumentFile, DocumentType, AnalysisResult } from './types';
 import { DEFAULT_AGENTS, FLOWER_THEMES, LOCALIZATION } from './constants';
-import { processAgentPrompt, performOcr } from './services/geminiService';
+import { processAgentPrompt, performOcr, initGeminiService } from './services/geminiService';
 import AgentStep from './components/AgentStep';
 import { PlusIcon, PlayIcon, UploadIcon, DocumentIcon, FileTextIcon, SettingsIcon, PaletteIcon, LanguageIcon, SunIcon, MoonIcon } from './components/icons';
 
@@ -36,6 +36,23 @@ function useLocalStorage<T>(key: string, initialValue: T): [T, React.Dispatch<Re
 }
 
 const App: React.FC = () => {
+  // API Key State
+  const [envApiKey] = useState(process.env.REACT_APP_GEMINI_API_KEY || '');
+  const [userApiKey, setUserApiKey] = useLocalStorage('geminiApiKey', '');
+  const [apiKeyError, setApiKeyError] = useState<string>('');
+  const [tempApiKey, setTempApiKey] = useState<string>('');
+  
+  const effectiveApiKey = useMemo(() => envApiKey || userApiKey, [envApiKey, userApiKey]);
+  const isApiKeySet = useMemo(() => !!effectiveApiKey, [effectiveApiKey]);
+
+  // Initialize service when key becomes available
+  useEffect(() => {
+    if (effectiveApiKey) {
+      initGeminiService(effectiveApiKey);
+      if (apiKeyError) setApiKeyError(''); // Clear previous errors on new key
+    }
+  }, [effectiveApiKey, apiKeyError]);
+
   // UI State
   const [themeIndex, setThemeIndex] = useLocalStorage('themeIndex', 0);
   const [isDarkMode, setIsDarkMode] = useLocalStorage('isDarkMode', true);
@@ -93,11 +110,10 @@ const App: React.FC = () => {
       fileReader.onload = async (e) => {
         const typedarray = new Uint8Array(e.target?.result as ArrayBuffer);
         const pdf = await pdfjsLib.getDocument(typedarray).promise;
-        // Process all pages
         const pageTexts = [];
         for (let i = 1; i <= pdf.numPages; i++) {
           const page = await pdf.getPage(i);
-          const viewport = page.getViewport({ scale: 2.0 }); // Higher scale for better OCR
+          const viewport = page.getViewport({ scale: 2.0 });
           const canvas = window.document.createElement('canvas');
           const context = canvas.getContext('2d');
           canvas.height = viewport.height;
@@ -105,29 +121,33 @@ const App: React.FC = () => {
           await page.render({ canvasContext: context!, viewport }).promise;
           const imageDataUrl = canvas.toDataURL('image/jpeg', 0.9);
           const base64Data = imageDataUrl.split(',')[1];
-          const ocrText = await performOcr(base64Data);
-          pageTexts.push(`--- Page ${i} ---\n${ocrText}`);
+          try {
+            const ocrText = await performOcr(base64Data);
+            pageTexts.push(`--- Page ${i} ---\n${ocrText}`);
+          } catch (ocrError) {
+             const errorMessage = ocrError instanceof Error ? ocrError.message : 'An OCR error occurred';
+             if (errorMessage.includes('API key')) {
+                setApiKeyError(errorMessage);
+                setUserApiKey(''); // Clear the invalid key
+             }
+             pageTexts.push(`--- Page ${i} ---\n[OCR Failed: ${errorMessage}]`);
+             break; // Stop processing further pages
+          }
         }
         setDocumentFile(prev => ({ ...prev, content: pageTexts.join('\n\n') }));
       };
       fileReader.readAsArrayBuffer(file);
     } catch (error) {
       console.error("Failed to process PDF", error);
-      setDocumentFile(prev => ({ ...prev, content: 'Error processing PDF.' }));
+      const errorMessage = error instanceof Error ? error.message : 'Error processing PDF.';
+      setDocumentFile(prev => ({ ...prev, content: errorMessage }));
     } finally {
       setIsOcrProcessing(false);
     }
   };
 
   const addAgent = (template: Omit<Agent, 'id' | 'status' | 'output' | 'error' | 'outputJson'>) => {
-    const newAgent: Agent = {
-      ...template,
-      id: `agent-${Date.now()}`,
-      status: AgentStatus.Pending,
-      output: null,
-      error: null,
-      outputJson: null,
-    };
+    const newAgent: Agent = { ...template, id: `agent-${Date.now()}`, status: AgentStatus.Pending, output: null, error: null, outputJson: null };
     setAgents(prev => [...prev, newAgent]);
   };
 
@@ -147,15 +167,12 @@ const App: React.FC = () => {
             return JSON.parse(jsonString);
         }
         return JSON.parse(text);
-      } catch (e) {
-        return null;
-      }
+      } catch (e) { return null; }
   };
   
   const analyzeResults = (currentAgents: Agent[]) => {
       const sentimentAgent = currentAgents.find(a => a.name === 'Sentiment Analyzer' && a.status === AgentStatus.Success);
       const entityAgent = currentAgents.find(a => a.name === 'Entity Extractor' && a.status === AgentStatus.Success);
-      
       let newAnalysis: AnalysisResult = { sentiment: null, entities: null };
 
       if(sentimentAgent?.outputJson?.sentiment) {
@@ -164,11 +181,9 @@ const App: React.FC = () => {
           else if (s === 'negative') newAnalysis.sentiment = { positive: 0, negative: 1, neutral: 0 };
           else newAnalysis.sentiment = { positive: 0, negative: 0, neutral: 1 };
       }
-
       if(entityAgent?.outputJson && Array.isArray(entityAgent.outputJson)) {
         newAnalysis.entities = entityAgent.outputJson.filter(e => e.name && e.type);
       }
-      
       if(newAnalysis.sentiment || (newAnalysis.entities && newAnalysis.entities.length > 0)) {
           setAnalysisResult(newAnalysis);
           setActiveTab('dashboard');
@@ -180,10 +195,8 @@ const App: React.FC = () => {
       alert("Please load a document first.");
       return;
     }
-    
     setIsProcessing(true);
     setAnalysisResult(null);
-
     let currentAgents = agents.map(a => ({...a, status: AgentStatus.Pending, output: null, error: null, outputJson: null}));
     setAgents(currentAgents);
 
@@ -197,22 +210,54 @@ const App: React.FC = () => {
         setAgents(currentAgents);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
+        if (errorMessage.includes('API key')) {
+            setApiKeyError(errorMessage);
+            setUserApiKey(''); // Clear the invalid key
+        }
         currentAgents = currentAgents.map(a => (a.id === agent.id ? { ...a, status: AgentStatus.Error, error: errorMessage } : a));
         setAgents(currentAgents);
         break;
       }
     }
-    
     analyzeResults(currentAgents);
     setIsProcessing(false);
-  }, [agents, documentFile.content, documentFile.type]);
-
+  }, [agents, documentFile.content, documentFile.type, setUserApiKey]);
+  
+  const ApiKeyModal = () => (
+    <div className="fixed inset-0 bg-gray-900/80 backdrop-blur-sm flex items-center justify-center z-50">
+        <div className="bg-white dark:bg-gray-800 p-8 rounded-xl shadow-2xl w-full max-w-md m-4">
+            <h2 className="text-2xl font-bold mb-2 text-gray-800 dark:text-gray-100">Setup API Key</h2>
+            <p className="text-gray-600 dark:text-gray-400 mb-6">
+                Your Gemini API key is not configured. Please enter it below to continue.
+            </p>
+            <div className="space-y-4">
+                <input 
+                    type="password" 
+                    value={tempApiKey}
+                    onChange={(e) => setTempApiKey(e.target.value)}
+                    placeholder="Enter your Gemini API key"
+                    className="w-full p-3 bg-gray-100 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-primary transition"
+                />
+                {apiKeyError && <p className="text-sm text-red-500">{apiKeyError}</p>}
+                <button 
+                    onClick={() => { if (tempApiKey.trim()) setUserApiKey(tempApiKey.trim()); }}
+                    className="w-full px-4 py-3 bg-primary text-white font-semibold rounded-lg shadow hover:opacity-90 transition-opacity disabled:bg-gray-400"
+                    disabled={!tempApiKey.trim()}
+                >
+                    Save and Continue
+                </button>
+            </div>
+            <p className="text-xs text-gray-500 mt-4 text-center">
+                Your API key is stored only in your browser's local storage.
+            </p>
+        </div>
+    </div>
+  );
   const NotesEditor = () => {
     const [notes, setNotes] = useLocalStorage('reviewNotes', `# ${T.yourNotes}\n\n`);
     const [textToColor, setTextToColor] = useState('');
     const [color, setColor] = useState('#E91E63');
-
-    const applyColor = () => {
+  const applyColor = () => {
         if (!textToColor.trim()) return;
         const coloredText = `<span style="color: ${color}; font-weight: 600;">${textToColor}</span>`;
         // Replace only the first occurrence to avoid infinite loops if colored text is re-colored
@@ -244,6 +289,7 @@ const App: React.FC = () => {
     );
   };
   
+
   const TabButton = ({ tabName, label }: { tabName: string, label: string }) => (
     <button onClick={() => setActiveTab(tabName)} className={`px-4 py-2 text-sm font-semibold rounded-md transition-all duration-200 ${activeTab === tabName ? 'bg-primary text-white shadow' : 'text-gray-600 dark:text-gray-300 hover:bg-primary/10'}`}>
         {label}
